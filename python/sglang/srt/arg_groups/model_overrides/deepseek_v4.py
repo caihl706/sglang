@@ -78,6 +78,9 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             and cfg.moe_a2a_backend == "none"
             and not envs.SGLANG_DSV4_FP4_DEQUANT.get()
             and model_config.is_fp4_experts
+            # compressed-tensors experts (e.g. W4A8) use the Triton runner,
+            # which needs local expert ids; flashinfer_mxfp4 keeps global ids.
+            and quant.get("quant_method") != "compressed-tensors"
             and (
                 get_platform().is_sm90
                 or get_platform().is_sm100

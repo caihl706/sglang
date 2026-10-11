@@ -220,7 +220,10 @@ class _ColumnvLLMParameter(BasevLLMParameter):
                         self.output_dim, start_idx, shard_size
                     )
 
-        assert param_data.shape == loaded_weight.shape
+        assert param_data.shape == loaded_weight.shape, (
+            f"{param_data.shape=}, {loaded_weight.shape=}, "
+            f"{self.output_dim=}, {shard_offset=}, {shard_size=}"
+        )
         param_data.copy_(loaded_weight)
 
     def load_qkv_weight(
@@ -361,7 +364,46 @@ class ChannelQuantScaleParameter(_ColumnvLLMParameter):
     channel-wise quantization. Equivalent to _ColumnvLLMParameter.
     """
 
-    pass
+    def _match_trailing_singleton_to_param(
+        self, loaded_weight: torch.Tensor
+    ) -> torch.Tensor:
+        """Squeeze the checkpoint's trailing singleton only when the parameter
+        is 1-D.
+
+        Channelwise scales are saved as ``[out, 1]`` (``keepdim=True`` in the
+        quantizer). FP8 per-channel registers a 1-D parameter, so the extra
+        dim must be dropped before the base loader narrows along ``output_dim``.
+        INT8 W8A8 registers ``[out, 1]`` directly, so dropping it would leave
+        ``param_data`` at rank 2 and fail the shape assert.
+        """
+        if (
+            loaded_weight.ndim == 2
+            and loaded_weight.shape[-1] == 1
+            and self.data.ndim == 1
+        ):
+            return loaded_weight.squeeze(-1)
+        return loaded_weight
+
+    def load_column_parallel_weight(
+        self,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+        use_presharded_weights: bool = False,
+    ):
+        loaded_weight = self._match_trailing_singleton_to_param(loaded_weight)
+        super().load_column_parallel_weight(loaded_weight, tp_rank, use_presharded_weights)
+
+    def load_merged_column_weight(self, loaded_weight: torch.Tensor, **kwargs):
+        loaded_weight = self._match_trailing_singleton_to_param(loaded_weight)
+        super().load_merged_column_weight(loaded_weight, **kwargs)
+
+    def load_row_parallel_weight(self, loaded_weight: torch.Tensor):
+        loaded_weight = self._match_trailing_singleton_to_param(loaded_weight)
+        super().load_row_parallel_weight(loaded_weight)
+
+    def load_qkv_weight(self, loaded_weight: torch.Tensor, **kwargs):
+        loaded_weight = self._match_trailing_singleton_to_param(loaded_weight)
+        super().load_qkv_weight(loaded_weight, **kwargs)
 
 
 class BlockQuantScaleParameter(_ColumnvLLMParameter, RowvLLMParameter):

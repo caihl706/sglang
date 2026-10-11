@@ -193,7 +193,7 @@ def fused_experts_none_to_triton(
             fused_experts_mxfp8,
         )
 
-        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        topk_weights, topk_ids = dispatch_output.topk_output[:2]
         output = fused_experts_mxfp8(
             hidden_states=dispatch_output.hidden_states,
             w1=quant_info.w13_weight,

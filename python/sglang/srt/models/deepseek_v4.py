@@ -766,6 +766,12 @@ class MqaAttentionBase(nn.Module):
         if attn_tp_rank is None or attn_tp_size is None:
             attn_tp_rank = get_parallel().attn_tp_rank
             attn_tp_size = get_parallel().attn_tp_size
+
+        # Auto-downgrade attn_tp_size when o_groups < attn_tp_size to avoid division by zero
+        # This happens with small o_groups (e.g., 8) and large TP (e.g., 16)
+        if config.o_groups < attn_tp_size:
+            attn_tp_rank, attn_tp_size = 0, 1
+
         self.attn_tp_rank: int = attn_tp_rank
         self.attn_tp_size: int = attn_tp_size
 
@@ -5599,30 +5605,41 @@ class DeepseekV4ForCausalLM(nn.Module):
                             elif (
                                 COMPRESSOR_PART in name
                                 and ".wkv_gate." not in name
-                                and (name.rsplit(".", 2)[0] + ".wkv_gate.weight")
+                                and (
+                                    name.endswith(".wkv.weight")
+                                    or name.endswith(".wgate.weight")
+                                    or name.endswith(".wkv.weight_scale")
+                                    or name.endswith(".wgate.weight_scale")
+                                )
+                                and (
+                                    name.rsplit(".", 2)[0]
+                                    + ".wkv_gate."
+                                    + name.rsplit(".", 1)[-1]
+                                )
                                 in params_dict
                             ):
                                 # Split-projection modules load per parameter instead.
-                                is_kv = name.endswith(".wkv.weight")
-                                is_wgate = name.endswith(".wgate.weight")
+                                suffix = name.rsplit(".", 1)[-1]
+                                is_kv = ".wkv." in name
+                                is_wgate = ".wgate." in name
                                 assert is_kv != is_wgate
                                 key = name.rsplit(".", 2)[0]
                                 assert key.endswith(".compressor")
-                                if key not in cache_compressor_weight:
-                                    cache_compressor_weight[key] = (
+                                cache_key = (key, suffix)
+                                if cache_key not in cache_compressor_weight:
+                                    cache_compressor_weight[cache_key] = (
                                         is_kv,
                                         _clone_if_runai_streamed_tensor(loaded_weight),
                                     )
                                 else:
-                                    assert key in cache_compressor_weight
                                     cached_is_kv, cached_weight = (
-                                        cache_compressor_weight[key]
+                                        cache_compressor_weight[cache_key]
                                     )
                                     assert cached_is_kv != is_kv
                                     kv = loaded_weight if is_kv else cached_weight
                                     wgate = loaded_weight if is_wgate else cached_weight
                                     fused_weight = torch.cat([kv, wgate], dim=0)
-                                    param_name = key + ".wkv_gate.weight"
+                                    param_name = key + ".wkv_gate." + suffix
                                     param = params_dict[param_name]
                                     weight_loader = auto_weight_loader(param)
                                     maybe_executor_submit(
@@ -5633,7 +5650,7 @@ class DeepseekV4ForCausalLM(nn.Module):
                                         func_args=(param, fused_weight),
                                     )
                                     loaded_params.add(param_name)
-                                    cache_compressor_weight.pop(key)
+                                    cache_compressor_weight.pop(cache_key)
                             elif (
                                 fuse_wqa_wkv
                                 and ".compressor." not in name
@@ -5643,6 +5660,8 @@ class DeepseekV4ForCausalLM(nn.Module):
                                     or name.endswith(".wq_a.weight_scale_inv")
                                     or name.endswith(".wkv.weight")
                                     or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
                                     or name.endswith(".wq_a.qweight_type")
@@ -5808,6 +5827,18 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _dequant_int8_channelwise(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """INT8 [N, K] * per-output-channel scale [N, 1] (or [N]) -> BF16 [N, K]."""
+    assert weight.dtype == torch.int8, f"expected int8, got {weight.dtype}"
+    scale = scale.float()
+    if scale.ndim == 1:
+        scale = scale.unsqueeze(-1)
+    assert scale.shape == (weight.shape[0], 1), (
+        f"expected channelwise scale {(weight.shape[0], 1)}, got {tuple(scale.shape)}"
+    )
+    return (weight.float() * scale).to(torch.bfloat16)
+
+
 def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
@@ -5819,6 +5850,18 @@ def _dequant_fp8_wo_a_streaming(
         if name.endswith(".wo_a.weight"):
             prefix = name[: -len(".weight")]
             bucket = pending.setdefault(prefix, {})
+            if tensor.dtype == torch.int8:
+                # compressed-tensors INT8 channelwise wo_a: wo_a is applied via a
+                # BF16 grouped bmm and keeps no quant_config, so fold the
+                # per-output-channel scale into a BF16 weight at load time.
+                int8_scale = bucket.pop("int8_scale", None)
+                if int8_scale is not None:
+                    pending.pop(prefix, None)
+                    emitted = True
+                    yield name, _dequant_int8_channelwise(tensor, int8_scale)
+                else:
+                    bucket["int8_weight"] = _clone_if_runai_streamed_tensor(tensor)
+                continue
             scale = bucket.pop("scale", None)
             if scale is not None:
                 pending.pop(prefix, None)
@@ -5826,6 +5869,18 @@ def _dequant_fp8_wo_a_streaming(
                 yield name, _dequant_fp8(tensor, scale)
             else:
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
+            continue
+
+        if name.endswith(".wo_a.weight_scale"):
+            prefix = name[: -len(".weight_scale")]
+            bucket = pending.setdefault(prefix, {})
+            int8_weight = bucket.pop("int8_weight", None)
+            if int8_weight is not None:
+                pending.pop(prefix, None)
+                emitted = True
+                yield prefix + ".weight", _dequant_int8_channelwise(int8_weight, tensor)
+            else:
+                bucket["int8_scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
         if name.endswith(".wo_a.scale"):
@@ -5846,6 +5901,8 @@ def _dequant_fp8_wo_a_streaming(
     if emitted:
         logger.info("Finished streaming dequant fp8 wo_a")
     for prefix, bucket in pending.items():
+        assert "int8_weight" not in bucket, f"{prefix}.weight_scale is missing"
+        assert "int8_scale" not in bucket, f"{prefix}.weight is missing"
         if "weight" in bucket:
             assert not saw_wo_a_scale, f"{prefix}.scale is missing"
             yield prefix + ".weight", bucket["weight"]
