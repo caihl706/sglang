@@ -714,6 +714,12 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         self.lm_head.weight = head
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # FP8 checkpoints store weight_scale_inv params; compressed-tensors
+        # checkpoints keep the plain weight_scale name.
+        is_compressed_tensors = (
+            type(self.quant_config).__name__ == "CompressedTensorsConfig"
+        )
+
         def mapped_weights():
             for name, loaded_weight in weights:
                 if name.startswith("model.mtp_layers."):
@@ -723,7 +729,7 @@ class HYV4ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                 )
                 if name.endswith((".hc_fn", ".hc_head_fn")):
                     name += ".weight"
-                if name.endswith(".weight_scale"):
+                if name.endswith(".weight_scale") and not is_compressed_tensors:
                     name += "_inv"
                 yield name, loaded_weight
 
