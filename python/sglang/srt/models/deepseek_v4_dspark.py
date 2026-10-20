@@ -778,6 +778,48 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
         return y.view(shape)
 
 
+def _dequant_markov_head_streaming(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Fold an FP8 channelwise ``markov_head.head`` into a bf16 weight at load.
+
+    markov_w2 is a plain nn.Linear with no quant params, so an FP8 weight would
+    be cast into it with its ``weight_scale_inv`` dropped. Order-independent;
+    non-FP8 head weights pass through unchanged.
+    """
+    suffix_w, suffix_s = ".markov_head.head.weight", ".markov_head.head.weight_scale_inv"
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+
+    for name, tensor in weights:
+        if name.endswith(suffix_w) and tensor.dtype != torch.float8_e4m3fn:
+            yield name, tensor
+            continue
+        if name.endswith(suffix_w) or name.endswith(suffix_s):
+            is_w = name.endswith(suffix_w)
+            prefix = name[: -len(suffix_w if is_w else suffix_s)]
+            bucket = pending.setdefault(prefix, {})
+            bucket["w" if is_w else "s"] = tensor
+            if len(bucket) == 2:
+                del pending[prefix]
+                scale = bucket["s"].float()
+                if scale.ndim == 1:
+                    scale = scale.unsqueeze(-1)
+                w = bucket["w"]
+                assert scale.shape == (w.shape[0], 1), (
+                    f"{prefix}: expected channelwise scale {(w.shape[0], 1)}, "
+                    f"got {tuple(scale.shape)}"
+                )
+                yield prefix + suffix_w, (w.float() * scale).to(torch.bfloat16)
+            continue
+        yield name, tensor
+
+    for prefix, bucket in pending.items():
+        raise ValueError(
+            f"{prefix}.markov_head.head: FP8 weight and weight_scale_inv must both "
+            f"be present, got {sorted(bucket)}"
+        )
+
+
 class DeepseekV4ForCausalLMDSpark(nn.Module):
     # ModelSlim NPU checkpoints carry QuaRot-aligned, MTP-local
     # embedding/head weights. The native CUDA path keeps the original DSpark
@@ -1072,6 +1114,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         loaded_params = set()
 
         weights = _dequant_fp8_wo_a_streaming(weights)
+        weights = _dequant_markov_head_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

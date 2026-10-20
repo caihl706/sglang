@@ -5380,6 +5380,8 @@ class DeepseekV4ForCausalLM(nn.Module):
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
+        weights = _dequant_fp8_lm_head_streaming(weights)
+
         # Must mirror MQALayer.__init__'s `quantize_wo_a`: dequantizing wo_a here
         # while the layer allocated an FP8 parameter (or vice versa) fails the
         # weight loader's dtype check.
@@ -5883,9 +5885,11 @@ def _dequant_fp8_wo_a_streaming(
                 bucket["int8_scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
+        # ".scale": 原始 FP8 block 检查点; ".weight_scale_inv": 量化脚本输出的
+        # FP8 channelwise (N, 1) scale。_dequant_fp8 按 shape 推断块大小, 两者通用。
+        if name.endswith(".wo_a.scale") or name.endswith(".wo_a.weight_scale_inv"):
             saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+            prefix = name[: name.rindex(".wo_a.") + len(".wo_a")]
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
@@ -5908,6 +5912,47 @@ def _dequant_fp8_wo_a_streaming(
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
             yield prefix + ".scale", bucket["scale"]
+
+
+def _dequant_fp8_lm_head_streaming(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    """Fold an FP8 channelwise top-level ``head.weight`` into a bf16 weight at load.
+
+    ParallelLMHead is built with UnquantizedEmbeddingMethod (Fp8Config only
+    handles LinearBase/FusedMoE/RadixAttention), so it has no weight_scale_inv
+    param and an FP8 weight would be copied into a bf16 param unscaled.
+    Order-independent; non-FP8 head weights pass through unchanged.
+    """
+    w_name, s_name = "head.weight", "head.weight_scale_inv"
+    bucket: dict[str, torch.Tensor] = {}
+
+    for name, tensor in weights:
+        if name == w_name and tensor.dtype != torch.float8_e4m3fn:
+            yield name, tensor
+            continue
+        if name == w_name or name == s_name:
+            bucket["w" if name == w_name else "s"] = _clone_if_runai_streamed_tensor(
+                tensor
+            )
+            if len(bucket) == 2:
+                w, scale = bucket.pop("w"), bucket.pop("s").float()
+                if scale.ndim == 1:
+                    scale = scale.unsqueeze(-1)
+                assert scale.shape == (w.shape[0], 1), (
+                    f"head.weight_scale_inv: expected channelwise scale "
+                    f"{(w.shape[0], 1)}, got {tuple(scale.shape)}"
+                )
+                yield w_name, (w.float() * scale).to(torch.bfloat16)
+                logger.info("Finished streaming dequant fp8 lm_head")
+            continue
+        yield name, tensor
+
+    if bucket:
+        raise ValueError(
+            "head.weight: FP8 weight and weight_scale_inv must both be present, "
+            f"got {sorted(bucket)}"
+        )
 
 
 def _dequant_fp8_wo_a(
