@@ -218,6 +218,9 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         layer_prefix = f"model.layers.{self.config.num_hidden_layers}"
+        is_compressed_tensors = (
+            type(self.quant_config).__name__ == "CompressedTensorsConfig"
+        )
 
         def mapped_weights():
             for name, loaded_weight in weights:
@@ -231,7 +234,7 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config
                 )
-                if name.endswith(".weight_scale"):
+                if name.endswith(".weight_scale") and not is_compressed_tensors:
                     name += "_inv"
                 yield name, loaded_weight
 

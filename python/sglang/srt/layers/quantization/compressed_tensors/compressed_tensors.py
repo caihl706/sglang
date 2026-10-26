@@ -975,6 +975,18 @@ class CompressedTensorsConfig(QuantizationConfig):
             if _is_npu and self._is_dynamic_token_w4a8(weight_quant, input_quant):
                 logger.info_once("Using NPUCompressedTensorsW4A8Int8DynamicMoE")
                 return NPUCompressedTensorsW4A8Int8DynamicMoE(self)
+            # cutlass_w4a8_moe only supports group_size=128 scales; serve
+            # channel-wise checkpoints weight-only via Marlin instead.
+            if (
+                not _is_npu
+                and weight_quant.strategy == QuantizationStrategy.CHANNEL.value
+            ):
+                logger.warning_once(
+                    "Channel-wise W4A8 MoE is not supported by the cutlass W4A8 "
+                    "kernel; serving this checkpoint weight-only via Marlin "
+                    "(CompressedTensorsWNA16MoE). Activation quantization is ignored."
+                )
+                return CompressedTensorsWNA16MoE(self, weight_quant=weight_quant)
             logger.info_once("Using CompressedTensorsW4AFP8MoE")
             return CompressedTensorsW4AFP8MoE(self, weight_quant, input_quant)
         elif self._is_dynamic_token_w4a8(weight_quant, input_quant):
