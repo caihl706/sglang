@@ -458,7 +458,10 @@ class CompressedTensorsWNA16MoE(CompressedTensorsMoEScheme):
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output
 
-        topk_weights, topk_ids, router_logits = topk_output
+        # Attribute access: the packed variant carries a fourth field.
+        topk_weights = topk_output.topk_weights
+        topk_ids = topk_output.topk_ids
+        router_logits = topk_output.router_logits
 
         # Get expert_map for EP support
         expert_map = None

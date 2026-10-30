@@ -41,6 +41,7 @@ from sglang.srt.models.deepseek_v4 import (
     DeepseekV4ForCausalLM,
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
+    _clone_if_runai_streamed_tensor,
     _dequant_fp8_wo_a_streaming,
     hc_head_torch,
     make_hc_head_params,
@@ -381,6 +382,36 @@ def _resolve_dspark_pool() -> DeepSeekV4TokenToKVPool:
         f"got {type(pool).__name__}."
     )
     return pool
+
+
+def _dequant_int8_markov_head_streaming(
+    weights: Iterable[Tuple[str, torch.Tensor]],
+) -> Iterable[Tuple[str, torch.Tensor]]:
+    # markov_w2 is a plain nn.Linear with no weight_scale, so an INT8
+    # channelwise checkpoint is expanded to fp32 before loading.
+    pending: dict[str, dict[str, torch.Tensor]] = {}
+    for name, tensor in weights:
+        is_scale = name.endswith(".markov_head.head.weight_scale")
+        is_weight = name.endswith(".markov_head.head.weight")
+        if is_weight and tensor.dtype != torch.int8:
+            is_weight = False
+        if not (is_scale or is_weight):
+            yield name, tensor
+            continue
+        prefix = name.removesuffix(".weight_scale" if is_scale else ".weight")
+        bucket = pending.setdefault(prefix, {})
+        bucket["scale" if is_scale else "weight"] = _clone_if_runai_streamed_tensor(
+            tensor
+        )
+        if len(bucket) == 2:
+            pending.pop(prefix)
+            yield (
+                prefix + ".weight",
+                bucket["weight"].float() * bucket["scale"].float(),
+            )
+    for prefix, bucket in pending.items():
+        assert "weight" not in bucket, f"{prefix}.weight_scale is missing"
+        yield prefix + ".weight_scale", bucket["scale"]
 
 
 class MarkovW2ShardGeometry(msgspec.Struct, frozen=True):
@@ -1012,6 +1043,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
         loaded_params = set()
 
         weights = _dequant_fp8_wo_a_streaming(weights)
+        weights = _dequant_int8_markov_head_streaming(weights)
 
         stacked_params_mapping = DEEPSEEK_V4_STACKED_PARAMS_MAPPING
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE

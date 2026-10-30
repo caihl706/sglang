@@ -5442,8 +5442,10 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 and (
                                     name.endswith(".wq_a.weight")
                                     or name.endswith(".wq_a.weight_scale_inv")
+                                    or name.endswith(".wq_a.weight_scale")
                                     or name.endswith(".wkv.weight")
                                     or name.endswith(".wkv.weight_scale_inv")
+                                    or name.endswith(".wkv.weight_scale")
                                     or name.endswith(".wq_a.qweight")
                                     or name.endswith(".wkv.qweight")
                                     or name.endswith(".wq_a.qweight_type")
@@ -5609,10 +5611,25 @@ def _clone_if_runai_streamed_tensor(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+def _dequant_wo_a(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    if weight.dtype == torch.int8:
+        return (weight.float() * scale.float()).bfloat16()
+    return _dequant_fp8(weight, scale)
+
+
+def _wo_a_scale_suffix(name: str) -> Optional[str]:
+    # ".scale" is FP8 blockwise; ".weight_scale" is INT8 channelwise.
+    for suffix in (".wo_a.scale", ".wo_a.weight_scale"):
+        if name.endswith(suffix):
+            return suffix[len(".wo_a") :]
+    return None
+
+
 def _dequant_fp8_wo_a_streaming(
     weights: Iterable[Tuple[str, torch.Tensor]],
 ) -> Iterable[Tuple[str, torch.Tensor]]:
     pending: dict[str, dict[str, torch.Tensor]] = {}
+    scale_suffixes: dict[str, str] = {}
     saw_wo_a_scale = False
     emitted = False
 
@@ -5624,20 +5641,22 @@ def _dequant_fp8_wo_a_streaming(
             if scale is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield name, _dequant_fp8(tensor, scale)
+                yield name, _dequant_wo_a(tensor, scale)
             else:
                 bucket["weight"] = _clone_if_runai_streamed_tensor(tensor)
             continue
 
-        if name.endswith(".wo_a.scale"):
+        scale_suffix = _wo_a_scale_suffix(name)
+        if scale_suffix is not None:
             saw_wo_a_scale = True
-            prefix = name[: -len(".scale")]
+            prefix = name[: -len(scale_suffix)]
+            scale_suffixes[prefix] = scale_suffix
             bucket = pending.setdefault(prefix, {})
             weight = bucket.pop("weight", None)
             if weight is not None:
                 pending.pop(prefix, None)
                 emitted = True
-                yield prefix + ".weight", _dequant_fp8(weight, tensor)
+                yield prefix + ".weight", _dequant_wo_a(weight, tensor)
             else:
                 bucket["scale"] = _clone_if_runai_streamed_tensor(tensor)
             continue
@@ -5651,7 +5670,7 @@ def _dequant_fp8_wo_a_streaming(
             assert not saw_wo_a_scale, f"{prefix}.scale is missing"
             yield prefix + ".weight", bucket["weight"]
         if "scale" in bucket:
-            yield prefix + ".scale", bucket["scale"]
+            yield prefix + scale_suffixes[prefix], bucket["scale"]
 
 
 def _dequant_fp8_wo_a(
