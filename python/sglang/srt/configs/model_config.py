@@ -215,6 +215,7 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
+            "HYV4FlashForConditionalGeneration",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
         )
@@ -256,12 +257,15 @@ def is_glm_moe_dsa(config) -> bool:
     )
 
 
+KIMI_K3_ARCHS = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    return _hf_arch(config) in KIMI_K3_ARCHS
 
 
 _KIMI_K31_ARCHS = (
@@ -1545,6 +1549,7 @@ class ModelConfig:
             or "LongcatFlashForCausalLMNextN" in self.hf_config.architectures
             or "HYV4ForCausalLM" in self.hf_config.architectures
             or "HYV4ForCausalLMNextN" in self.hf_config.architectures
+            or "HYV4FlashForConditionalGeneration" in self.hf_config.architectures
             or "DotsVLMForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLM" in self.hf_config.architectures
             or "Dots3NoteForCausalLMNextN" in self.hf_config.architectures
@@ -2596,6 +2601,7 @@ multimodal_model_archs = [
     "GlmOcrForConditionalGeneration",
     "GlmAsrForConditionalGeneration",
     "GlmImageForConditionalGeneration",
+    "HYV4FlashForConditionalGeneration",
     "Grok1VForCausalLM",
     "Grok1AForCausalLM",
     "LlavaLlamaForCausalLM",

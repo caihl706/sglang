@@ -174,7 +174,8 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
     if (
         cfg.disaggregation_mode == "decode"
         and cfg.disaggregation_decode_enable_radix_cache
-        and cfg.speculative_algorithm not in (None, "DSPARK", "EAGLE", "EAGLE3")
+        and cfg.speculative_algorithm
+        not in (None, "DFLASH", "DSPARK", "EAGLE", "EAGLE3")
     ):
         raise ValueError(
             "--disaggregation-decode-enable-radix-cache is incompatible "
@@ -326,9 +327,10 @@ def _handle_dflash(server_args: ServerArgs) -> None:
                 "SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION=0."
             )
 
-    if cfg.pp_size != 1:
+    if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "Currently DFLASH speculative decoding only supports pp_size == 1."
+            "DFLASH pipeline parallelism requires PD prefill; decode and "
+            "non-disaggregated serving require pp_size == 1."
         )
 
     if cfg.speculative_draft_model_path is None:
@@ -436,7 +438,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     _resolve_dflash_draft_attention_backend(server_args)
-    _reject_dflash_sliding_mla_draft_window(server_args)
+    _resolve_dflash_mla_draft_window(server_args)
     _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
@@ -447,6 +449,84 @@ def _handle_dflash(server_args: ServerArgs) -> None:
         )
         logger.warning(
             "Max running requests is reset to 48 for speculative decoding. You can override this by explicitly setting --max-running-requests."
+        )
+
+
+DEFAULT_DFLY_BLOCK_SIZE = 6
+
+
+def _dfly_block_size_from_checkpoint(cfg) -> Optional[int]:
+    from sglang.srt.hf_transformers import get_config
+
+    hf_config = get_config(
+        cfg.model_path,
+        trust_remote_code=cfg.trust_remote_code,
+        revision=cfg.revision,
+    )
+    block_size = getattr(hf_config, "dfly_block_size", None)
+    if block_size is not None:
+        return int(block_size)
+    spec = getattr(hf_config, "speculative_config", None)
+    if isinstance(spec, dict) and spec.get("num_speculative_tokens") is not None:
+        return int(spec["num_speculative_tokens"]) + 1
+    return None
+
+
+def _handle_dfly(server_args: ServerArgs) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.device.startswith("cuda"):
+        raise ValueError("DFLY speculative decoding requires CUDA.")
+    if attn_dp_enabled_of(cfg) or cfg.pp_size != 1 or cfg.attn_cp_size != 1:
+        raise ValueError("DFLY does not support DP attention, PP or CP.")
+    if cfg.disaggregation_mode != "null":
+        raise ValueError("DFLY does not support PD disaggregation.")
+    if cfg.enable_lora:
+        raise ValueError("DFLY does not support LoRA.")
+    if cfg.speculative_draft_model_path not in (None, cfg.model_path):
+        raise ValueError("DFLY drafts live in the target checkpoint.")
+    if cfg.speculative_draft_attention_backend is not None:
+        raise ValueError("DFLY drafts run on the target attention backend.")
+    for name in ("speculative_num_steps", "speculative_eagle_topk"):
+        if getattr(cfg, name) not in (None, 1):
+            raise ValueError(f"DFLY requires {name} == 1.")
+        declare_resolution(server_args, "_handle_dfly", **{name: 1})
+    if cfg.speculative_dfly_block_size is not None:
+        block_size = int(cfg.speculative_dfly_block_size)
+        if block_size <= 0:
+            raise ValueError(
+                "DFLY requires --speculative-dfly-block-size to be positive, "
+                f"got {block_size}."
+            )
+        if cfg.speculative_num_draft_tokens not in (None, block_size):
+            raise ValueError(
+                "--speculative-num-draft-tokens and --speculative-dfly-block-size "
+                f"differ ({cfg.speculative_num_draft_tokens} vs {block_size}); "
+                "for DFLY they must match."
+            )
+        declare_resolution(
+            server_args, "_handle_dfly", speculative_num_draft_tokens=block_size
+        )
+    elif cfg.speculative_num_draft_tokens is None:
+        block_size = _dfly_block_size_from_checkpoint(cfg)
+        if block_size is None:
+            block_size = DEFAULT_DFLY_BLOCK_SIZE
+            logger.warning(
+                "The checkpoint declares no DFly block size; defaulting to %d.",
+                block_size,
+            )
+        declare_resolution(
+            server_args, "_handle_dfly", speculative_num_draft_tokens=block_size
+        )
+    if not 2 <= int(cfg.speculative_num_draft_tokens) <= 17:
+        raise ValueError("DFLY requires a block size in [2, 17].")
+    if cfg.enable_mixed_chunk:
+        declare_resolution(server_args, "_handle_dfly", enable_mixed_chunk=False)
+        logger.warning("Mixed chunked prefill is disabled for DFLY.")
+    if cfg.max_running_requests is None:
+        declare_resolution(server_args, "_handle_dfly", max_running_requests=48)
+        logger.warning(
+            "Max running requests is reset to 48 for speculative decoding. You "
+            "can override this by explicitly setting --max-running-requests."
         )
 
 
@@ -1058,28 +1138,41 @@ def _resolve_dflash_draft_attention_backend(server_args: ServerArgs) -> None:
     )
 
 
-def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
+def _resolve_dflash_mla_draft_window(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
     from sglang.srt.speculative.dflash_utils import (
-        get_dflash_layer_types,
         parse_dflash_draft_config,
+        resolve_mla_draft_compact_window,
     )
 
     cfg = resolving_view(server_args)
-    draft_backend = cfg.speculative_draft_attention_backend
-    if (
-        cfg.speculative_draft_window_size is None
-        or draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS
-    ):
+    window_size = cfg.speculative_draft_window_size
+    if window_size is None:
+        return
+    if cfg.speculative_draft_attention_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
         return
     draft_hf_config = _load_draft_hf_config(cfg)
     if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return
-    layer_types = get_dflash_layer_types(draft_hf_config)
-    if layer_types and "sliding_attention" in layer_types:
-        raise ValueError(
-            "--speculative-draft-window-size is not supported for an MLA draft "
-            f"with sliding-window layers on {draft_backend}: the backend applies "
-            "the draft's own window."
+    kept = resolve_mla_draft_compact_window(
+        draft_hf_config,
+        window_size=window_size,
+        dcp_size=cfg.dcp_size,
+        page_size=cfg.page_size,
+        megakernel=bool(cfg.enable_nvidia_megakernel),
+    )
+    if kept is None:
+        logger.warning(
+            "DFLASH: --speculative-draft-window-size %d is dropped on %s: every "
+            "draft layer is sliding_attention and the backend applies that window "
+            "itself over the full request table.",
+            window_size,
+            cfg.speculative_draft_attention_backend,
+        )
+        declare_resolution(
+            server_args,
+            "_resolve_dflash_mla_draft_window",
+            speculative_draft_window_size=None,
         )
 
 
@@ -1104,6 +1197,7 @@ def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
         ),
         enable_unified_memory=cfg.enable_unified_memory,
         dcp_size=cfg.dcp_size,
+        draft_window_size=cfg.speculative_draft_window_size,
     )
     if reason is not None:
         if switch.is_set():

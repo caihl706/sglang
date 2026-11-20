@@ -398,7 +398,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    s_i = tl.program_id(0)
+    s_i = tl.program_id(0).to(tl.int64)
 
     h = tl.arange(0, H)
     dt = tl.arange(0, D_TAIL)
@@ -680,9 +680,14 @@ def _sparse_mla_fused_kernel(
     # topk, leaving the -1 tail to slot >= 0.
     TOPK_TAIL_INVALID: tl.constexpr = False,
     KV_SCALED: tl.constexpr = False,
+    sink_ptr=None,
+    HAS_SINK: tl.constexpr = False,
 ):
-    """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
-    t = tl.program_id(0)
+    """Single-pass with head-block splitting. grid=(seq, head_blocks).
+
+    HAS_SINK adds a per-head learnable sink logit (natural-log units, like the
+    scaled scores) to the softmax denominator."""
+    t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -803,6 +808,9 @@ def _sparse_mla_fused_kernel(
 
     denom = tl.maximum(l_i, 1.0e-30)
     inv_denom = 1.0 / denom
+    if HAS_SINK:
+        sink2 = tl.load(sink_ptr + h_offs, mask=h_mask, other=0.0) * 1.4426950408889634
+        inv_denom = 1.0 / (denom + tl.exp2(sink2 - m_i))
     acc0 = tl.where(l_i[:, None] > 0.0, acc0 * inv_denom[:, None], 0.0)
     if NUM_GROUPS >= 2:
         acc1 = tl.where(l_i[:, None] > 0.0, acc1 * inv_denom[:, None], 0.0)
@@ -872,7 +880,7 @@ def _sparse_mla_split_k_kernel(
     KV_SCALED: tl.constexpr = False,
 ):
     """Split-K partial kernel. grid=(seq, head_blocks, kv_splits)."""
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
     pid_k = tl.program_id(2)
 
@@ -1057,9 +1065,13 @@ def _sparse_mla_reduce_kernel(
     BLOCK_K: tl.constexpr,
     lse_out_ptr=None,
     STORE_LSE: tl.constexpr = False,
+    sink_ptr=None,
+    HAS_SINK: tl.constexpr = False,
 ):
-    """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
-    t = tl.program_id(0)
+    """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks).
+
+    HAS_SINK adds a per-head sink logit to the softmax denominator."""
+    t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
     dc = tl.program_id(2)
 
@@ -1096,6 +1108,10 @@ def _sparse_mla_reduce_kernel(
     w_sum = tl.sum(weights, axis=0)
     scale = tl.exp2(lse_p - lse_max - tl.log2(tl.maximum(w_sum, 1.0e-30)))
     out = tl.sum(a_p * scale[:, None], axis=0)
+    if HAS_SINK:
+        lse_all = lse_max + tl.log2(tl.maximum(w_sum, 1.0e-30))
+        sink2 = tl.load(sink_ptr + h) * 1.4426950408889634
+        out = out / (1.0 + tl.exp2(sink2 - lse_all))
 
     tl.store(
         out_ptr + t * H * D_V + h * D_V + d_offs,

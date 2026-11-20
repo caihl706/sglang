@@ -231,6 +231,10 @@ def _load_fused_expert_tensor(
             continue
         param_name = name[: -len(source)] + target
         param = params_dict.get(param_name)
+        if param is None and param_name.endswith("_scale_inv"):
+            # PATCH(per-channel FP8): compressed-tensors MoE registers w13/w2_weight_scale
+            param_name = param_name.removesuffix("_inv")
+            param = params_dict.get(param_name)
         if param is None:
             return False
         weight_loader = param.weight_loader

@@ -217,6 +217,11 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
         self.lm_head.weight = head
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
+        # FP8 checkpoints store weight_scale_inv params; compressed-tensors
+        # checkpoints keep the plain weight_scale name.
+        is_compressed_tensors = (
+            type(self.quant_config).__name__ == "CompressedTensorsConfig"
+        )
         layer_prefix = f"model.layers.{self.config.num_hidden_layers}"
 
         def mapped_weights():
@@ -231,7 +236,7 @@ class HYV4ForCausalLMNextN(nn.Module, DeepseekV2WeightLoaderMixin):
                 loaded_weight = permute_hyv4_indexer_weight(
                     name, loaded_weight, self.config
                 )
-                if name.endswith(".weight_scale"):
+                if name.endswith(".weight_scale") and not is_compressed_tensors:
                     name += "_inv"
                 yield name, loaded_weight
 
