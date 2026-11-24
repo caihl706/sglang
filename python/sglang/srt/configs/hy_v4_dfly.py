@@ -44,7 +44,15 @@ _SUPPORTED_KV_CACHE_DTYPES = ("auto", "bf16", "bfloat16")
 _SUPPORTED_DSA_DECODE_BACKEND = "flashmla_sparse"
 _FP8_FORMAT = "float-quantized"
 _MXFP4_FORMAT = "mxfp4-pack-quantized"
-_CHECKPOINT_FORMATS = (_FP8_FORMAT, _MXFP4_FORMAT, "mixed-precision")
+_INT4_FORMAT = "pack-quantized"  # PATCH(int4/int8)
+_INT8_FORMAT = "int-quantized"  # PATCH(int4/int8)
+_CHECKPOINT_FORMATS = (
+    _FP8_FORMAT,
+    _MXFP4_FORMAT,
+    _INT4_FORMAT,
+    _INT8_FORMAT,
+    "mixed-precision",
+)
 _FP8_BLOCK_WEIGHTS = dict(
     num_bits=8,
     type="float",
@@ -246,6 +254,8 @@ def check_hyv4_dfly_quant_config(quantization_config: Optional[dict]) -> None:
             raise ValueError(error)
         if not (
             _is_block_fp8_group(group, checkpoint_format)
+            or _is_channel_token_fp8_group(group, checkpoint_format)
+            or _is_int_w4a8_group(group, checkpoint_format)
             or _is_mxfp4_group(group, checkpoint_format)
         ):
             raise ValueError(error)
@@ -368,6 +378,46 @@ def _is_block_fp8_group(group: dict, checkpoint_format: Optional[str]) -> bool:
         (group.get("format") or checkpoint_format) == _FP8_FORMAT
         and _matches(group.get("weights"), _FP8_BLOCK_WEIGHTS)
         and _matches(group.get("input_activations"), _FP8_GROUP_ACTIVATIONS)
+    )
+
+
+# PATCH(per-channel FP8): W8A8 FP8 with static per-output-channel weights and
+# dynamic per-token activations.
+_FP8_CHANNEL_WEIGHTS = dict(
+    num_bits=8, type="float", strategy="channel", symmetric=True, dynamic=False
+)
+_FP8_TOKEN_ACTIVATIONS = dict(
+    num_bits=8, type="float", strategy="token", symmetric=True, dynamic=True
+)
+
+
+def _is_channel_token_fp8_group(group: dict, checkpoint_format: Optional[str]) -> bool:
+    return (
+        (group.get("format") or checkpoint_format) == _FP8_FORMAT
+        and _matches(group.get("weights"), _FP8_CHANNEL_WEIGHTS)
+        and _matches(group.get("input_activations"), _FP8_TOKEN_ACTIVATIONS)
+    )
+
+
+# PATCH(int4/int8): static channel/group symmetric INT4 or INT8 weights with
+# dynamic per-token INT8 activations (compressed-tensors W4A8 / W8A8 INT).
+_INT_ACTIVATIONS = dict(
+    num_bits=8, type="int", strategy="token", symmetric=True, dynamic=True
+)
+
+
+def _is_int_w4a8_group(group: dict, checkpoint_format: Optional[str]) -> bool:
+    weights = group.get("weights")
+    fmt = group.get("format") or checkpoint_format
+    return (
+        fmt in (_INT4_FORMAT, _INT8_FORMAT)
+        and isinstance(weights, dict)
+        and weights.get("type") == "int"
+        and weights.get("num_bits") in (4, 8)
+        and weights.get("symmetric") is True
+        and weights.get("dynamic") is False
+        and weights.get("strategy") in ("channel", "group")
+        and _matches(group.get("input_activations"), _INT_ACTIVATIONS)
     )
 
 

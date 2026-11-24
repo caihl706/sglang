@@ -46,6 +46,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsW8A8Fp8,
+    CompressedTensorsW8A8Int8,  # PATCH(int8 draft)
 )
 from sglang.srt.layers.quantization.compressed_tensors.utils import (
     check_equal_or_regex_match,
@@ -114,7 +115,9 @@ def _check_draft_linear_schemes(model: nn.Module) -> None:
         if (
             isinstance(module, LinearBase)
             and isinstance(module.quant_method, CompressedTensorsLinearMethod)
-            and not isinstance(module.scheme, CompressedTensorsW8A8Fp8)
+            and not isinstance(
+                module.scheme, (CompressedTensorsW8A8Fp8, CompressedTensorsW8A8Int8)
+            )
         ):
             raise ValueError(
                 f"HYV4 DFly draft linear {name} must be BF16 or block FP8; the "
@@ -754,7 +757,9 @@ class HYV4ForCausalLMDFly(nn.Module, DeepseekV2WeightLoaderMixin):
                 continue
             dtype = (
                 param.dtype
-                if param.dtype == torch.float8_e4m3fn or name.endswith(".weight_scale")
+                # PATCH(int8 draft): INT8 draft weights keep their own dtype
+                if param.dtype in (torch.float8_e4m3fn, torch.int8)
+                or name.endswith(".weight_scale")
                 else torch.bfloat16
             )
             if name.startswith("layers."):

@@ -204,8 +204,9 @@ def _load_fused_indexer_wk(
         return fused_name
 
     # wk: a bf16 checkpoint copies straight in; block-fp8 needs weight + scale.
+    # PATCH(int8 indexer wk): channel INT8 also needs weight + scale.
     is_scale = name.endswith((".weight_scale_inv", ".weight_scale"))
-    if not is_scale and loaded_weight.dtype != torch.float8_e4m3fn:
+    if not is_scale and loaded_weight.dtype not in (torch.float8_e4m3fn, torch.int8):
         w = _clone_if_runai_streamed_tensor(loaded_weight)
         fused_param.data[: w.shape[0]].copy_(w)
         return fused_name
@@ -216,10 +217,16 @@ def _load_fused_indexer_wk(
     )
     if "weight" in entry and "scale" in entry:
         pending.pop(fused_name)
-        block_size = _get_indexer_weight_block_size(quant_config)
-        wk_bf16 = block_quant_dequant(
-            entry["weight"], entry["scale"], block_size, torch.bfloat16
-        )
+        if entry["weight"].dtype == torch.int8:
+            # PATCH(int8 indexer wk): per-output-channel scale [out, 1]
+            wk_bf16 = (
+                entry["weight"].float() * entry["scale"].float().view(-1, 1)
+            ).to(torch.bfloat16)
+        else:
+            block_size = _get_indexer_weight_block_size(quant_config)
+            wk_bf16 = block_quant_dequant(
+                entry["weight"], entry["scale"], block_size, torch.bfloat16
+            )
         fused_param.data[: wk_bf16.shape[0]].copy_(wk_bf16)
     return fused_name
 
